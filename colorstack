@@ -1,0 +1,387 @@
+#!/usr/bin/env ruby
+
+#require 'rbconfig'
+#if (RbConfig::CONFIG['MINOR'] == '8')
+#  begin
+#    require 'rubygems'
+#  rescue LoadError
+#    puts "Error: Couldn't load 'rubygems'. Is the package installed?"
+#    exit(1)
+#  end
+#end
+
+require 'optparse'
+require 'fcntl'
+
+$stdout.sync = true
+$stderr.sync = true
+
+# color shortcuts
+BLK = '30m'
+RED = '31m'
+GRN = '32m'
+YLW = '33m'
+BLU = '34m'
+MAG = '35m'
+CYN = '36m'
+WHT = '37m'
+
+module ColorStack
+  class Event
+    # For ruby 1.9
+    #@@regex_event = /^
+    #  (?<date>[-0-9]+)\s+   # date: 2012-03-09
+    #  (?<time>[0-9:,]+)\s+  # time: 00:01:26,877
+    #  (?<type>\w+)\s+       # type: DEBUG|INFO|WARN|ERROR
+    #  \[(?<class>.*?)\]\s+  # class: [cloud.server.StatsCollector]
+    #  \((?<agent>.*?)\)\s+  # agent: (DirectAgent-9:null)
+    #  (?<msg>.*)            # everything else
+    #$/x
+    @@regex_event = /^
+      ([-0-9]+)\s+   # date: 2012-03-09
+      ([0-9:,]+)\s+  # time: 00:01:26,877
+      (\w+)\s+       # type: DEBUG|INFO|WARN|ERROR
+      \[(.*?)\]\s+   # class: [cloud.server.StatsCollector]
+      \((.*?)\)\s+   # agent: (DirectAgent-9:null)
+      (.*)           # everything else
+    $/x
+
+    #@@regex_job = /(\s|:)(?<job>job-[0-9]+)/
+    @@regex_job = /(\s|:)(job-[0-9]+)/
+
+    #@@regex_cmd = / (?<cmd>\{.*\})/
+    @@regex_cmd = / (\{.*\})/
+
+    #@@regex_direct_agent = /^
+    #  (?<seq>Seq\s+[-0-9]+):\s+   # seq: Seq 7-246874114:
+    #  (?<msg>.*)                  # everything else
+    #$/x
+    
+    @@bad_words = %w(
+      fail
+      error(?!(string|(\ to\ expunging)))
+      exception
+      unable
+      can't
+      disconnect
+      insufficient
+      no\ suitable
+    )
+    #(?<!cleanup )fail  #ruby 1.8 doesn't have lookbehind
+
+    @@meh_words = %w(
+      shutdown
+      shutting
+      destroy(?!((system)?vmcmd)|command)
+      no\ secondary\ storage
+      StopRequestedvm
+      OperationRetryvm
+    )
+
+    @@good_words = %w(
+      reconnect
+      completed
+      transitioned
+      OperationSucceededvm
+      StartRequestedvm
+    )
+
+    # 
+    # Constructor
+    #
+    def initialize(log_event)
+      @date  = nil          # Date of log entry
+      @time  = nil          # Timestamp of entry
+      @type  = nil          # The type of event (debug, info, warn...)
+      @class = nil          # The Java class generating the message
+      @agent = nil          # The related CloudStack component
+      @seq   = nil          # The request sequence number (if any)
+      @job   = nil          # The async job number (if any)
+      @msg   = nil          # The rest of the message...
+      @cmd   = nil          # The embedded command/response (if any)
+      @java_excep = false   # Boolean: Is this a java exception?
+
+      # This is the log entry given to us.
+      #
+      # (color sequences will be injected into it)
+      @log_event = log_event
+
+      # Normal entries begin with timestamps
+      if (log_event =~ /^\d+-/)
+        m = @@regex_event.match(log_event)
+
+        #@date  = m[:date]    # ruby 1.9
+        #@time  = m[:time]    #
+        #@type  = m[:type]    #
+        #@class = m[:class]   #
+        #@agent = m[:agent]   #
+        #@msg   = m[:msg]     #
+        @date  = $1
+        @time  = $2
+        @type  = $3
+        @class = $4
+        @agent = $5
+        @msg   = $6
+
+        # are there any job numbers associated?
+        if m = @@regex_job.match(@agent) || @@regex_job.match(@msg)
+          #@job = m[:job]
+          @job = $2
+        end
+
+        # are there are any cloudstack commands?
+        if m = @@regex_cmd.match(@msg)
+          #@cmd = m[:cmd]
+          @cmd = $1
+        end
+
+      # Java exceptions look like this....
+      elsif ((log_event =~ /^(\w+\.)+/) or (log_event =~ /^\tat\s/))
+        # 
+        # /^com.foo.bar.blah:/ 
+        # /^\tat com.cloud.some.class(someFile.java:323)/
+        #
+        @java_excep = true  # set a flag
+      end
+    end #initialize
+
+
+    ##########################################################################
+    # Function:     'colorize!'
+    #
+    # Parameters:
+    #   'string'  - Regexp or String to colorize
+    #   'color'   - Which color to use (as defined above)
+    #   'bold'    - Whether to make it bold
+    #
+    # Description:  This function modifies the instance variable @log_event
+    #               by inserting ANSI escapes into it.  The real magic here is
+    #               the logic that handles nesting a color within a string that
+    #               is already colorized.  To demonstrate with an example, if
+    #               we have a previously colored string that looks like:
+    #
+    #                 [RED]this is sample data, bitches[OFF]
+    #
+    #               and we want to color the word "sample" green,
+    #               we _DON'T_ want to end up with:
+    #
+    #                 [RED]this is [GREEN]sample[OFF] data, bitches[OFF]
+    #
+    #               because all the color gets shut off after the word "sample",
+    #               as apposed to continuing to be red.  So what we want is:
+    #
+    #                 [RED]this is [GREEN]sample[RED] data, bitches[OFF]
+    #
+    #               This string substitution can't be achieved dynamically
+    #               using PCRE 'look around' zero-width assertions because
+    #               look-behind requires a fixed-width pattern (can't use
+    #               quantifiers like '*').  Thus, we iterate over the string
+    #               manually and insert our characters.
+    #
+    def colorize!(string, color, bold=1)
+      # if they passed us a plain string, escape it
+      if string.class == String
+        string = Regexp.escape(string)
+      end
+
+      # this is the default sequence to terminate with (color off)
+      end_seq = "\e[0m"
+
+      # now determine whether we're in the middle of an existing color
+      # we do this by checking if there is an existing "color off" sequence
+      # *right* in front of us. (IMPORTANT: that means non-greedy match)
+      if @log_event =~ /#{string}.*?(\e\[0m)/
+        # find the location of our target string
+        return unless (index = @log_event.index(/#{string}/))
+        # find the location of the color sequence we're interrupting
+        where = nil
+        index.downto(0) do |i|  # go backwards until we find <ESC> char
+          if (@log_event[i].chr == "\e")  #.chr ensures we work with 1.8
+            where = i
+            break
+          end
+        end
+        # now scrape out the color sequence
+        #@log_event.match(/(\e\[[\d;]+m)/, where) #ruby 1.9 only
+        @log_event[where..-1].match(/(\e\[[\d;]+m)/)
+        end_seq = $1 || "\e[0;37m" # default to white in case badness occurred
+      end
+
+      # finally wrap the color sequences around our target text
+      @log_event.sub!(/(#{string})/, "\e[#{bold};#{color}\\1#{end_seq}")
+    end #def colorize!
+
+    ##########################################################################
+    # Function:     'pp'
+    #
+    # Parameters:   none
+    # Description:  This function handles the logic about which patterns to
+    #               colorize (and which colors to use) in addition to actually
+    #               printing the final result.  These pattern/color
+    #               configurations should be extracted into an external config
+    #               file and not hard-coded into the program.
+    def pp
+      # XXX if we have a java exception, just print it red and return
+      if @java_excep
+        @log_event.rstrip!
+        print "\e[0;#{RED}#{@log_event}\e[0m\n"
+        return
+      end
+
+      # if we didn't recognize this log entry as any normal/structured event,
+      # just print it plain text and return
+      if ! @date
+        print @log_event
+        return
+      end
+
+      # Colorize the category name (event type)
+      case @type
+      when 'DEBUG'
+        colorize!(@type, CYN)
+      when 'INFO'
+        colorize!(@type, GRN)
+      when 'WARN'
+        colorize!(@type, YLW)
+        colorize!(@msg,  YLW,0)
+      when 'ERROR'
+        colorize!(@type, RED)
+        colorize!(@msg,  RED,0)
+      end
+
+      # Maybe colorize these other fields (should be user-configurable)
+      #if @class
+      #  colorize!(@class, WHT)
+      #end
+      #if @agent
+      #  colorize!(@agent, YLW)
+      #end
+
+      # Colorize startup events (`/etc/init.d/cloud-management start')
+      if (@agent == "main:null")
+        colorize!(@msg, GRN, 0)
+      end
+
+      # Highlight some GOOD things in this broken world!!
+      if (@msg =~ /#{@@good_words.join('|')}/i)
+        colorize!(@msg, GRN, 0)
+      end
+
+      # Highlight any medium issues that occur in non-'WARN' event types
+      if ((@type !='WARN') and (@msg =~ /#{@@meh_words.join('|')}/i))
+        colorize!(@msg, YLW, 0)
+      end
+
+      # Highlight all errors that occur in non-'ERROR' event types
+      if ((@type !='ERROR') and (@msg =~ /#{@@bad_words.join('|')}/i))
+        colorize!(@msg, RED, 0)
+      end
+
+      # Colorize CloudStack commands and answers
+      if @cmd
+        if (@cmd !~ / # ignore this shit
+              (ClusterSyncAnswer|
+                GetStorageStatsAnswer|
+                GetHostStatsAnswer|
+                StatsAnswer|
+                Cleanup\ssucceeded)/x)
+          if @cmd =~ /\sCmd\s/
+            colorize!(@cmd, GRN, 0)
+          elsif @cmd =~ /\sAns:/
+            colorize!(@cmd, CYN, 0)
+          end
+        end
+      end
+
+      # Highlight new jobs that are submitted
+      if @msg =~ / async #{@job}/
+        colorize!(@msg, GRN, 0)
+      end
+
+      # Highlight job number
+      if @job
+        colorize!(@job, GRN)
+      end
+
+      # Highlight API command names
+      if @msg =~ /com\.cloud\.api\.commands\.(\w+)/
+        colorize!($1, GRN)
+      end
+      colorize!(/(Start|Stop)Command/, GRN)
+      colorize!(/storage\.(Create|Destroy)Command/, GRN)
+      colorize!(/storage\.(PrimaryStorage)?Download(Progress)?Command/, GRN)
+      colorize!(/routing\.DhcpEntryCommand/, GRN)
+
+      # Highlight template downloadPct
+      if @msg =~ /("downloadPct":\d+)/
+        colorize!($1, GRN)
+      end
+
+      # Highlight VM names
+      colorize!(/VM\[.*?\]/, BLU)
+      colorize!(/[isr]-\d+-VM/, BLU)
+
+      # Highlight VM state changes
+      if @msg =~ /(transitted) from :(\w+ to \w+)/
+        colorize!($1, CYN)
+        colorize!($2, CYN)
+      end
+
+      # Highlight volume cleanup
+      colorize!(/(Expunging|Detaching) Vol.*/, CYN, 0)
+
+      # Highlight other common errors
+      colorize!('DOWNLOAD_ERROR', RED)
+
+      # append a "color off" sequence to the very end for safety..
+      @log_event.sub!(/$/, "\e[0m")
+
+      # finally print the god damn thing
+      print @log_event
+    end #def pp
+
+  end #class 
+end #module 
+
+OptionParser.new(nil) do |opts|
+  opts.banner = <<-'BANNER'
+Usage: colorstack [<file>]
+
+This script will read CloudStack log events and colorize interesting things.
+By default it will read stdin.  If a filename is passed as an argument, it will
+read entries from that file instead.
+
+  BANNER
+  #opts.on('h', '--help', "Useless garbage") do
+  #  exit
+  #end
+
+  begin
+    opts.parse!(ARGV)
+  rescue OptionParser::ParseError => e
+    $stderr.puts e.message, "\n", opts
+    exit(-1)
+  end
+end
+
+if ARGV.empty?
+  # read from stdin
+  ARGF.each do |line|
+    event = ColorStack::Event.new(line)
+    event.pp
+  end
+else
+  begin
+    File.readlines(ARGV[0]).each do |line|
+      event = ColorStack::Event.new(line)
+      event.pp
+    end
+  rescue Exception => e
+    $stderr.puts e.message
+    exit(1)
+  end
+end
+
+exit(0)
+
+  
