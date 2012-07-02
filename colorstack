@@ -336,7 +336,7 @@ module ColorStack
       # append a "color off" sequence to the very end for safety..
       @log_event.sub!(/$/, "\e[0m")
 
-      # finally print the god damn thing
+      # finally print the damn thing
       print @log_event
     end #def pp
 

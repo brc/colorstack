@@ -14,3 +14,5 @@ Examples
     $ tail -f /var/log/cloud/management/management-server.log | colorstack
     $ colorstack somefile.log  #same as `colorstack < somefile.log'
     $ zcat management-server.log.2012-05-2?.gz | colorstack | less -R
+
+Hasn't been tested with CloudStack 3.x yet.
